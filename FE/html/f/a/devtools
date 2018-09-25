@@ -1,0 +1,357 @@
+% if ($return) {
+%   $return->{'result'} = 'ok';
+%   deep_utf8_decode($return);
+%   my $json = to_json($return);
+  <% $json %>
+% } elsif ($err) {
+{"result":"nok"}
+% } else {
+{"result":"ok"}
+% }
+ 
+<%attr>
+  design_id => '1'
+  page_id => '0'
+  requires_auth => '1'
+  has_chat => '0'
+</%attr>
+
+<%method accept_all_invitations>
+<%perl>
+
+  my $tournament = $logic->get_tournament_by_id($tournament_id);
+
+  if (!$tournament) {
+    $err = 'no-such-tournament';
+  }
+
+  if ($err) {
+    $logger->debug("SMP:devtools:init: user [".$session->{'user_info'}->{'user_id'}."] tried to $action for tournament [".$tournament_id."]. Error = [".$err."]"); 
+    return;
+  } else {
+    $logger->debug("SMP:devtools:init: user [".$session->{'user_info'}->{'user_id'}."] tried to $action for tournament [".$tournament_id."]. Proceeding."); 
+  }
+
+  my $data;
+  $data->{'invitation_status'} = XXX::Logic::INVITATION_ACCEPTED_BY_PART;
+  $return = $logic->update_record('ktvs_tournaments_invitations', $data, 'inv_tournament_id', $tournament_id)
+
+</%perl>
+<%args>
+$action
+$tournament_id
+</%args>
+</%method>
+
+<%shared>
+  my $self = $m->request_comp;
+  my $logic;
+  my $logger;
+  my $err = '';
+  my $user_info;
+  my $profile_user_id;
+  my $profile_channel_id;
+  my $return;
+</%shared>
+
+<%init>
+  # use utf8;
+  use lib $r->dir_config('SCRIPTSPATH');
+  use XXX::Logic;
+  use XXX::Logger;
+  use POSIX;
+  use Data::Dumper;
+  use JSON;
+  use Encode;
+  use Deep::Encode;
+  use HTML::Restrict;
+  use HTTP::Request;
+  use LWP::UserAgent;
+  use URI::Escape;
+  ################ CONF ##################
+
+  my $update_fields;
+  my $actions;
+
+  $actions->{'accept_all_invitations'} = {
+    'function' => 'SELF:accept_all_invitations',
+  };
+
+  $actions->{'accept_all_invitations'}->{'parameters'} = {
+    'tournament_id' => 'tournament_id',
+    'action' => 'action'
+  };   
+
+  ########################################
+  my $loglevel = $r->dir_config('sys-debug-level') || 'none';
+  $logger = new XXX::Logger($r,$loglevel);
+  my $logic_data;
+  $logic_data->{r} = $r;
+  $logic_data->{iduser} = $session->{'user_id'};
+  $logic_data->{production} = 1;
+  $logic_data->{loglevel} = 'debug';
+
+  $logic = new XXX::Logic($logic_data);
+  my $sm = new XXX::SessionManager($r);
+
+  my $hr = HTML::Restrict->new();
+  my $hr_html = HTML::Restrict->new(
+    rules => {
+        a      => [qw(href target)],
+        b      => [],
+        br     => [qw(/)],
+        center => [],
+        h1     => [],
+        h2     => [],
+        h3     => [],
+        h4     => [],
+        h5     => [],
+        h6     => [],
+        hr     => [qw(/)],
+        i      => [],
+        img    => [qw(alt border height width src style /)],
+        li     => [],
+        ol     => [],
+        p      => [qw(style)],
+        span   => [qw(style)],
+        strong => [],
+        sub    => [],
+        sup    => [],
+        u      => [],
+        ul     => []
+    },
+    uri_schemes => [ 'undef', 'http', 'https', 'mailto' ],
+  );
+
+  $profile_user_id = $session->{'user_id'};
+  $profile_channel_id = $session->{'user_info'}->{'channel_info'}->{'channel_id'};
+
+  my $object_type = $ARGS{'object'};
+  my $object_id = $ARGS{'id'};
+  my $action_type = $ARGS{'action'};
+  my $update_type = $ARGS{'type'} || 'update';
+
+  if (($object_type) && (not($object_type ~~ keys $update_fields))) {
+
+    ## read configuration
+    my $config = $update_fields->{$object_type};
+    my $get_function = $config->{'get_function'};
+    my $update_function = $config->{'update_function'}; 
+    my $owner_id_field = $config->{'owner_id_field'};
+    my $create_function = $config->{'create_function'};
+    my $add_function = $config->{'add_function'};    
+    my $delete_function = $config->{'delete_function'};
+    my $remove_function = $config->{'remove_function'};
+    my $list_function = $config->{'list_function'};
+    my $auth_function = $config->{'auth_function'};
+    my $owner_type = $config->{'owner_type'} || 'user';
+    my $implicit_permission = $config->{'implicit_permission'};
+    my $id_parameters = $config->{'id_parameters'};
+
+    ## prepare permission information
+    my $object = $object_id ? $logic->$get_function($object_id) : '';
+    my $owner_id = $object ? $object->{$owner_id_field} : '';
+    my $owner_permission = ($owner_type eq 'user') ? 
+                            ($owner_id eq $profile_user_id) : 
+                            ($owner_id eq $profile_channel_id);
+
+    ## Resolve permission
+    my $permission = 0;
+
+    if ($auth_function) {
+
+      my $auth_params;
+      $auth_params->{'logic'} = $logic;
+      $auth_params->{'config'} = $config;
+      $auth_params->{'args'} = \%ARGS;
+      $auth_params->{'logger'} = $logger;
+
+      $permission = &$auth_function($auth_params);
+      $logger->trace("SMP:ajax:u:init: processes auth function with result = [".$permission."]");
+
+    } elsif ($object_id) {  ## if operation is for a specific object
+
+      if (  ($update_type eq 'delete') || 
+            ($object_type eq 'inbox_message') || 
+            ($object_type eq 'outbox_message')) {
+
+        ## check if object is actually in my list of objects
+        my $list_parameters = $config->{'list_parameters'};
+        my $object_list = $logic->$list_function(@$list_parameters);
+        $permission = defined($object_list->{$object_id});
+      } else {
+        ## if listing is not relevant just check if i'm the owner
+        $permission = $owner_permission;
+      }
+
+    } else {
+        ## if we're not talking about specific object
+        ## then approve if i'm trying to list or create a new object
+        $permission = (($update_type eq 'create') || 
+                       ($update_type eq 'list'  ) ||
+                       ($implicit_permission)
+                       ) ? 1 : 0;
+    }
+
+
+
+    ## DO THE WORK
+    if ($permission) {
+      if ($update_type eq 'update') {
+        ## prepare update parameters
+        my $update_data;
+
+
+        foreach my $parameter (keys $config->{'update_parameters'}) {
+          my $param_name = $config->{'update_parameters'}->{$parameter};
+          if (defined($ARGS{$param_name})) {
+            my $param_value = $ARGS{$param_name};
+            # utf8::decode($param_value);
+            if ($config->{'xss_parameters'}->{$parameter}) {
+              $param_value = $hr->process($param_value);
+            } elsif ($config->{'html_parameters'}->{$parameter}) {
+              $param_value = $hr_html->process($param_value);
+            }
+            $update_data->{$parameter} = $param_value;
+            $logger->trace("SMP:ajax:u:init: processed update parameter: original name = [$param_name] new name = [$parameter] original value = [".$ARGS{$param_name}."] final value = [$param_value]");
+          }
+        }
+
+        ## execute update
+        my $object_identifier = $id_parameters ? $id_parameters : $object_id;
+        # my $status;
+        # if ($id_parameters) {
+        #   # my $object_id_hashref;
+          
+        #   # foreach my $id_param (keys $id_parameters) {
+        #   #   $object_id_hashref->{$id_param} = $id_parameters->{$id_param};
+        #   # }
+
+        #   # $status = $logic->$update_function($object_id_hashref, $update_data);
+        #   $status = $logic->$update_function($id_parameters, $update_data);
+        # } else {
+        #   $status = $logic->$update_function($object_id, $update_data);
+        # }
+
+        my $status = $logic->$update_function($object_identifier, $update_data);
+
+        $err = $status->{'code'};
+        $logger->debug("SMP:ajax:u:init: attempted to update object [".$object_type."] information for user-id: [".$profile_user_id."]. Error code = [".$status->{'code'}."] Error reason = [".$status->{'reason'}."]");
+
+      } elsif ($update_type eq 'create') {
+
+        ## prepare create parameters
+        my $create_data;
+        foreach my $parameter (keys $config->{'create_parameters'}) {
+          my $param_name = $config->{'create_parameters'}->{$parameter};
+          if (defined($ARGS{$param_name})) {
+            my $param_value = $ARGS{$param_name};
+            if ($config->{'xss_parameters'}->{$parameter}) {
+              $param_value = $hr->process($param_value);
+            } elsif ($config->{'html_parameters'}->{$parameter}) {
+              $param_value = $hr_html->process($param_value);
+            }
+            $create_data->{$parameter} = $param_value;
+          }
+        }
+        if ($config->{'create_parameters_internal'}) {
+          foreach my $parameter (keys $config->{'create_parameters_internal'}) {
+            my $param_value = eval $config->{'create_parameters_internal'}->{$parameter};
+            if ($config->{'xss_parameters'}->{$parameter}) {
+              $param_value = $hr->process($param_value);
+            } elsif ($config->{'html_parameters'}->{$parameter}) {
+              $param_value = $hr_html->process($param_value);
+            }
+            $create_data->{$parameter} = $param_value;
+            $logger->debug("SMP:ajax:u:init: attempted to create object of type [ $object_type ] with internal parameter [ $parameter ] = [ $create_data->{$parameter} ] based on eval of [".$config->{'create_parameters_internal'}->{$parameter}."]")
+          }
+        }
+        if ($owner_id_field) {
+          $create_data->{$owner_id_field} = ($owner_type eq 'user') ? 
+                                            $profile_user_id : 
+                                            $profile_channel_id;
+        }
+
+        ## execute create
+        my $create_explicit_parameters = $config->{'create_explicit_parameters'};
+        my $status = $logic->$create_function($create_data,@$create_explicit_parameters);
+        if ($config->{'create_return'}) {
+          $return->{'id'} = $status->{$config->{'create_return'}};
+        }
+        $err = $status->{'code'};
+        $logger->debug("SMP:ajax:u:init: attempted to create object [".$object_type."] for user-id: [".$profile_user_id."]. Error code = [".$status->{'code'}."] Error reason = [".$status->{'reason'}."]");
+
+      } elsif ($update_type eq 'delete') {
+
+          my $status = $logic->$delete_function($object_id);
+          $err = $status->{'code'};
+          $logger->debug("SMP:ajax:u:init: attempted to delete object [".$object_type."] with id = [".$object_id."] for user-id: [".$profile_user_id."]. Delete function: [".$delete_function."] Error code = [".$status->{'code'}."] Error reason = [".$status->{'reason'}."]");
+
+      } elsif ($update_type eq 'remove') {
+
+        my $remove_data;
+        foreach my $parameter (keys $config->{'remove_parameters'}) {
+          my $param_name = $config->{'remove_parameters'}->{$parameter};
+          if (defined($ARGS{$param_name})) {
+            my $param_value = $ARGS{$param_name};
+            $remove_data->{$parameter} = $param_value;
+          }
+        }
+
+        my $status = $logic->$remove_function($remove_data);
+          $err = $status->{'code'};
+          $logger->debug("SMP:ajax:u:init: attempted to remove object [".$object_type."] with id = [".$object_id."] for user-id: [".$profile_user_id."]. Remove function: [".$remove_function."] Error code = [".$status->{'code'}."] Error reason = [".$status->{'reason'}."]");
+
+      } elsif ($update_type eq 'list') {
+
+        ## execute list
+        my $list_parameters = $config->{'list_parameters'};
+        $return = $logic->$list_function(@$list_parameters);
+        if ($return < 0) {
+          $err = $return;
+          $return = '';
+          $logger->debug("SMP:ajax:u:init: attempted to list objects of type [".$object_type."] for user-id: [".$profile_user_id."]. Error code = [".$err."]");
+        } else {
+          $logger->debug("SMP:ajax:u:init: listed object type [".$object_type."]  for user-id: [".$profile_user_id."] channel-id = [".$profile_channel_id."] with function = [".$list_function."] and parameters = [".$list_parameters."].");
+        }
+
+      } elsif ($update_type eq 'get') {
+
+        ## execute get
+        my $get_parameters = $config->{'get_parameters'};
+        $return = $object_id ? $logic->$get_function($object_id) : $logic->$get_function(@$get_parameters);
+        if ($return < 0) {
+          $err = $return;
+          $return = '';
+          # $err = $status->{'code'};
+          $logger->debug("SMP:ajax:u:init: attempted to get object [".$object_type."] with id = [".$object_id."] for user-id: [".$profile_user_id."]. Error code = [".$err."]");
+        }
+      } else {
+        $err = 'illegal_update_type';
+        $logger->debug("SMP:ajax:u:init: request to update object [".$object_type."] information for user-id: [".$profile_user_id."] with illegal update type = [".$update_type."]");              
+      }
+
+    } else {
+      $err = 'no_permission';
+      $logger->debug("SMP:ajax:u:init: attempted to update object type [".$object_type."] with object_id [".$object_id."] without permission for user-id: [".$profile_user_id."] channel-id = [".$profile_channel_id."]. permission = [".$permission."] owner_permission = [".$owner_permission."] owner_type = [".$owner_type."] owner_id = [".$owner_id."]");
+    }
+  } elsif (($action_type) && (not($action_type ~~ keys $actions))) {
+
+    my %parameters = ();
+    
+    foreach my $key (keys $actions->{$action_type}->{'parameters'}) {
+      $parameters{$actions->{$action_type}->{'parameters'}->{$key}} = $ARGS{$key};
+    }
+    
+    $m->comp($actions->{$action_type}->{'function'}, %parameters);
+
+  } else {
+    $logger->debug("SMP:ajax:u:init: attempted to update empty or unknown object type [".$object_type."] for user-id: [".$profile_user_id."] or use unsupported action [".$action_type."].");
+  }
+
+
+</%init>
+
+<%flags>
+  inherit => 'ajax_autohandler'
+</%flags>
